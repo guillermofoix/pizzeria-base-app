@@ -1,0 +1,93 @@
+# ==============================================================================
+# COMPOSE CAPA DE APLICACIÓN Y PERÍMETRO: PIZZERÍA BELLA NAPOLI
+# ==============================================================================
+# Arquitectura desacoplada: Este archivo gestiona exclusivamente el ciclo de
+# vida de la lógica de negocio (Backend Node.js, Frontend Nginx, WebApp QR
+# y Túnel Cloudflare Zero Trust).
+#
+# Requisito previo:
+#   1. Haber arrancado previamente la capa de datos (docker-compose.db.yml).
+#   2. La red 'pizzeria-network' debe existir.
+#
+# Arranque:
+#   docker compose -f docker-compose.app.yml up -d --build
+# ==============================================================================
+
+name: pizzeria-app
+
+services:
+  # 1. Backend API REST (Node.js Express)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pizzeria-prod-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: ${BACKEND_PORT:-3000}
+      DB_HOST: ${DB_HOST:-db}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_USER: ${DB_USER:-pizzeria_user}
+      DB_PASSWORD: "${DB_PASSWORD:?Define DB_PASSWORD en el archivo .env (copia .env.example a .env; ver la guia de despliegue)}"
+      DB_NAME: ${DB_NAME:-pizzeria_db}
+      CORS_ORIGIN: ${CORS_ORIGIN:-*}
+      # Cifrado SSL con la base de datos (con RDS se activa solo; "true" lo fuerza)
+      DB_SSL: ${DB_SSL:-}
+      # Pagos con Stripe (opcional: vacías = sin pasarela). Ver el apéndice de la guía de despliegue.
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      FRONTEND_URL: ${FRONTEND_URL:-}
+      # Reconciliación de pagos (vacías = valores por defecto: cada 2 min y espera de 30 s)
+      RECONCILIACION_MINUTOS: ${RECONCILIACION_MINUTOS:-}
+      RECONCILIACION_ESPERA_SEGUNDOS: ${RECONCILIACION_ESPERA_SEGUNDOS:-}
+    networks:
+      - pizzeria-network
+
+  # 2. Frontend Web Comercial, Cocina KDS y Proxy Inverso Nginx
+  frontend-web:
+    build:
+      context: ./frontend-web
+      dockerfile: Dockerfile
+    container_name: pizzeria-prod-web
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    volumes:
+      # Claves de /dbgate/ (HTTP Basic Auth). Crea .htpasswd ANTES del 'up': si no existe,
+      # Docker crea un directorio con ese nombre y Nginx no puede leerlo.
+      - ./.htpasswd:/etc/nginx/.htpasswd:ro
+    depends_on:
+      - backend
+    networks:
+      - pizzeria-network
+
+  # 3. WebApp Móvil PWA para Clientes y Mesas QR
+  frontend-qr-app:
+    build:
+      context: ./frontend-qr-app
+      dockerfile: Dockerfile
+    container_name: pizzeria-prod-qr
+    restart: unless-stopped
+    depends_on:
+      - backend
+    networks:
+      - pizzeria-network
+
+  # 4. Túnel Seguro Cloudflare Zero Trust (Conexión Perimetral Saliente)
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: pizzeria-prod-tunnel
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - frontend-web
+    networks:
+      - pizzeria-network
+
+# Red compartida externa: Se conecta a la red creada por el stack de datos
+networks:
+  pizzeria-network:
+    external: true

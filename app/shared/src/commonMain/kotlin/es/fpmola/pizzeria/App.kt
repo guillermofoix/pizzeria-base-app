@@ -1,0 +1,460 @@
+package es.fpmola.pizzeria
+
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Scaffold
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.lifecycle.viewmodel.compose.viewModel
+import es.fpmola.pizzeria.carrito.ResultadoAnadir
+import es.fpmola.pizzeria.di.Dependencias
+import es.fpmola.pizzeria.pedidos.DecisionArranque
+import es.fpmola.pizzeria.pedidos.Pedido
+import es.fpmola.pizzeria.diagnostico.CategoriaDiagnostico
+import es.fpmola.pizzeria.diagnostico.construirDiagnostico
+import es.fpmola.pizzeria.pedidos.debeComprobarPedidoGuardado
+import es.fpmola.pizzeria.pedidos.evaluarArranque
+import es.fpmola.pizzeria.pedidos.seguimientoTerminado
+import es.fpmola.pizzeria.ui.AvisoDemo
+import es.fpmola.pizzeria.ui.carrito.PantallaCarrito
+import es.fpmola.pizzeria.ui.catalogo.CatalogoViewModel
+import es.fpmola.pizzeria.ui.catalogo.PantallaCatalogo
+import es.fpmola.pizzeria.ui.catalogo.PantallaDetalle
+import es.fpmola.pizzeria.ui.configuracion.ConfiguracionViewModel
+import es.fpmola.pizzeria.ui.configuracion.PantallaConfiguracion
+import es.fpmola.pizzeria.ui.diagnostico.PantallaDiagnostico
+import es.fpmola.pizzeria.ui.inicio.InicioViewModel
+import es.fpmola.pizzeria.ui.inicio.PantallaInicio
+import es.fpmola.pizzeria.ui.pedidos.DatosPedidoViewModel
+import es.fpmola.pizzeria.ui.pedidos.PantallaBuscandoPedido
+import es.fpmola.pizzeria.ui.pedidos.debeVolverAlCarritoVacio
+import es.fpmola.pizzeria.ui.pedidos.PantallaDatosPedido
+import es.fpmola.pizzeria.ui.pedidos.PantallaPedidoConfirmado
+import es.fpmola.pizzeria.ui.pedidos.PedidoConfirmadoViewModel
+import es.fpmola.pizzeria.ui.tema.TemaPizzeria
+import kotlinx.coroutines.launch
+
+/** Pantallas de la app. La navegación es un simple estado, sin librería. */
+private enum class Pantalla { Configuracion, Diagnostico, Inicio, Catalogo, Detalle, Carrito, Datos, Confirmado }
+
+/**
+ * true cuando este proceso ya ha comprobado el pedido guardado. Por sí sola NO basta
+ * para saltarse la comprobación: quitar la app de "recientes" descarta el estado de la
+ * actividad pero puede dejar vivo el proceso, y la actividad nueva debe comprobar el
+ * pedido igualmente. Se combina con el indicador guardado en el estado de la actividad
+ * (ver [debeComprobarPedidoGuardado]).
+ */
+private var pedidoGuardadoComprobado = false
+
+/**
+ * Raíz de la app: tema de la pizzería, aviso de demo siempre visible y
+ * navegación por estado: Inicio → Catálogo → Detalle → Carrito → Datos →
+ * Confirmado.
+ *
+ * Atrás: Detalle → Catálogo; Catálogo → Inicio; Carrito → la pantalla desde la
+ * que se abrió; Datos → Carrito (bloqueado mientras se envía el pedido);
+ * Confirmado → Inicio (nunca vuelve al formulario).
+ *
+ * Al arrancar, si hay un pedido guardado (ver [es.fpmola.pizzeria.pedidos.PedidoEnCurso])
+ * que no ha terminado, se abre directamente su seguimiento.
+ *
+ * @param manejadorAtras permite a cada plataforma interceptar el botón atrás
+ * del sistema. Recibe si debe estar activo y qué hacer al pulsarlo. En Android
+ * se implementa con BackHandler (ver MainActivity).
+ */
+@Composable
+fun App(
+    manejadorAtras: @Composable (habilitado: Boolean, alAtras: () -> Unit) -> Unit = { _, _ -> },
+) {
+    TemaPizzeria {
+        // Con un servidor ya guardado se arranca en el inicio (la conexión se comprueba
+        // allí, en segundo plano). Solo sin servidor se pide en la configuración.
+        var pantalla by rememberSaveable {
+            mutableStateOf(
+                if (Dependencias.ajustes().obtenerUrlBase() != null) Pantalla.Inicio else Pantalla.Configuracion,
+            )
+        }
+        var pizzaSeleccionadaId by rememberSaveable { mutableStateOf<Int?>(null) }
+        // Cambian al guardar otro servidor o al pulsar "Reintentar": el catálogo
+        // de un servidor anterior no se reutiliza.
+        var versionServidor by rememberSaveable { mutableStateOf(0) }
+        var intentoCatalogo by rememberSaveable { mutableStateOf(0) }
+        // Pantalla desde la que se abrió el carrito (catálogo o detalle), para volver a ella.
+        var origenCarrito by rememberSaveable { mutableStateOf(Pantalla.Catalogo) }
+        // Pedido recién creado. El contador cambia con cada pedido enviado para que
+        // el siguiente empiece con un formulario nuevo.
+        var pedidoConfirmadoId by rememberSaveable { mutableStateOf<Int?>(null) }
+        var pedidosEnviados by rememberSaveable { mutableStateOf(0) }
+        var pedidoConfirmado by remember { mutableStateOf<Pedido?>(null) }
+        // Aviso de que el pedido con tarjeta se creó pero no se pudo iniciar el pago.
+        var avisoPagoInicial by remember { mutableStateOf<String?>(null) }
+        // true mientras se envía el pedido: el botón atrás no hace nada.
+        var enviandoPedido by remember { mutableStateOf(false) }
+        val carrito = remember { Dependencias.carrito() }
+        val pedidoEnCurso = remember { Dependencias.pedidoEnCurso() }
+        val registro = remember { Dependencias.registroDiagnostico() }
+        // Se guarda con el estado de la actividad: vale true tras girar la pantalla y
+        // vuelve a false cuando la actividad empieza de cero (por ejemplo, tras quitar
+        // la app de "recientes", aunque el proceso siga vivo).
+        var arranqueResuelto by rememberSaveable { mutableStateOf(false) }
+        // true si esta composición es un arranque de la app y no un giro de pantalla.
+        val esArranque = remember { !(arranqueResuelto && pedidoGuardadoComprobado) }
+        // Cambia al pulsar "Reintentar" en el inicio.
+        var intentoInicio by rememberSaveable { mutableStateOf(0) }
+        // true mientras se comprueba en el servidor el pedido guardado al arrancar.
+        var comprobandoPedido by remember {
+            mutableStateOf(
+                debeComprobarPedidoGuardado(
+                    hayPedidoGuardado = pedidoEnCurso.obtenerId() != null,
+                    resueltoEnActividad = arranqueResuelto,
+                    comprobadoEnProceso = pedidoGuardadoComprobado,
+                ),
+            )
+        }
+
+        LaunchedEffect(Unit) {
+            if (esArranque) {
+                registro.anotar(
+                    CategoriaDiagnostico.NAVEGACION,
+                    "Arranque de la app en la pantalla ${pantalla.name}; pedido guardado: " +
+                        (pedidoEnCurso.obtenerId()?.let { "n.º $it" } ?: "ninguno") + ".",
+                )
+                // Sin pedido guardado esta llamada responde al instante, sin red.
+                val informe = evaluarArranque(pedidoEnCurso, Dependencias.repositorioPedidos())
+                registro.anotar(
+                    CategoriaDiagnostico.ARRANQUE,
+                    informe.resumen + if (informe.idOlvidado) " Id olvidado." else "",
+                )
+                val decision = informe.decision
+                if (decision is DecisionArranque.SeguirPedido) {
+                    pedidoConfirmado = decision.pedido
+                    avisoPagoInicial = null
+                    pedidoConfirmadoId = decision.pedidoId
+                    pantalla = Pantalla.Confirmado
+                    registro.anotar(
+                        CategoriaDiagnostico.NAVEGACION,
+                        "Se abre el seguimiento del pedido n.º ${decision.pedidoId}.",
+                    )
+                }
+            }
+            pedidoGuardadoComprobado = true
+            arranqueResuelto = true
+            comprobandoPedido = false
+        }
+
+        // Sin servidor no se puede salir de la configuración: no hay adónde volver.
+        val hayServidor = Dependencias.ajustes().obtenerUrlBase() != null
+        manejadorAtras(
+            pantalla != Pantalla.Inicio && !(pantalla == Pantalla.Configuracion && !hayServidor),
+        ) {
+            pantalla = when (pantalla) {
+                Pantalla.Diagnostico -> Pantalla.Configuracion
+                Pantalla.Detalle -> Pantalla.Catalogo
+                Pantalla.Carrito -> origenCarrito
+                // Mientras se envía el pedido, atrás no hace nada.
+                Pantalla.Datos -> if (enviandoPedido) Pantalla.Datos else Pantalla.Carrito
+                else -> Pantalla.Inicio
+            }
+        }
+
+        Scaffold(bottomBar = { AvisoDemo() }) { relleno ->
+            val modificador = Modifier
+                .padding(relleno)
+                .fillMaxSize()
+
+            if (comprobandoPedido) {
+                PantallaBuscandoPedido(modifier = modificador)
+            } else when (pantalla) {
+                Pantalla.Configuracion -> {
+                    val modelo = viewModel {
+                        ConfiguracionViewModel(
+                            ajustes = Dependencias.ajustes(),
+                            repositorioSalud = Dependencias.repositorioSalud(),
+                        )
+                    }
+                    PantallaConfiguracion(
+                        estado = modelo.estado,
+                        alCambiarUrl = modelo::cambiarUrl,
+                        alProbarConexion = modelo::probarConexion,
+                        alGuardar = {
+                            val urlAnterior = Dependencias.ajustes().obtenerUrlBase()
+                            if (modelo.guardarUrl()) {
+                                // El pedido guardado es de otro servidor: aquí no existe o es otro.
+                                if (urlAnterior != Dependencias.ajustes().obtenerUrlBase()) {
+                                    pedidoEnCurso.olvidar()
+                                    registro.anotar(
+                                        CategoriaDiagnostico.PEDIDO,
+                                        "Id olvidado: se guardó otro servidor.",
+                                    )
+                                }
+                                versionServidor++
+                                pantalla = Pantalla.Inicio
+                            }
+                        },
+                        alAbrirDiagnostico = { pantalla = Pantalla.Diagnostico },
+                        alVolver = if (hayServidor) {
+                            { pantalla = Pantalla.Inicio }
+                        } else {
+                            null
+                        },
+                        modifier = modificador,
+                    )
+                }
+                Pantalla.Diagnostico -> {
+                    var instantanea by remember { mutableStateOf(0) }
+                    val diagnostico = remember(instantanea) {
+                        construirDiagnostico(
+                            info = Dependencias.infoCompilacion(),
+                            ajustes = Dependencias.ajustes(),
+                            pedidoEnCurso = pedidoEnCurso,
+                            registro = registro,
+                        )
+                    }
+                    PantallaDiagnostico(
+                        diagnostico = diagnostico,
+                        alActualizar = { instantanea++ },
+                        alBorrarHistorial = {
+                            registro.borrar()
+                            instantanea++
+                        },
+                        alVolver = { pantalla = Pantalla.Configuracion },
+                        modifier = modificador,
+                    )
+                }
+                Pantalla.Inicio -> {
+                    val modelo = viewModel<InicioViewModel>(key = "inicio-$versionServidor") {
+                        InicioViewModel(
+                            ajustes = Dependencias.ajustes(),
+                            repositorioSalud = Dependencias.repositorioSalud(),
+                        )
+                    }
+                    // La comprobación va en segundo plano: la pantalla se ve ya.
+                    LaunchedEffect(modelo, intentoInicio) {
+                        modelo.comprobar()
+                    }
+                    PantallaInicio(
+                        estado = modelo.estado,
+                        alVerCarta = { pantalla = Pantalla.Catalogo },
+                        alReintentar = { intentoInicio++ },
+                        alCambiarServidor = { pantalla = Pantalla.Configuracion },
+                        modifier = modificador,
+                    )
+                }
+                Pantalla.Catalogo -> {
+                    val modelo = catalogoViewModel(versionServidor, intentoCatalogo)
+                    PantallaCatalogo(
+                        estado = modelo.estado,
+                        alSeleccionarCategoria = modelo::seleccionarCategoria,
+                        alReintentar = { intentoCatalogo++ },
+                        alAbrirPizza = { pizza ->
+                            pizzaSeleccionadaId = pizza.id
+                            pantalla = Pantalla.Detalle
+                        },
+                        unidadesCarrito = carrito.totalUnidades,
+                        alAbrirCarrito = {
+                            origenCarrito = Pantalla.Catalogo
+                            pantalla = Pantalla.Carrito
+                        },
+                        alVolver = { pantalla = Pantalla.Inicio },
+                        modifier = modificador,
+                    )
+                }
+                Pantalla.Detalle -> {
+                    val modelo = catalogoViewModel(versionServidor, intentoCatalogo)
+                    val pizza = modelo.estado.pizzas.firstOrNull { it.id == pizzaSeleccionadaId }
+                    PantallaDetalle(
+                        pizza = pizza,
+                        cargando = modelo.estado.enCarga,
+                        unidadesCarrito = carrito.totalUnidades,
+                        alAnadirAlCarrito = { cantidad ->
+                            if (pizza != null) {
+                                carrito.anadir(pizza, cantidad)
+                            } else {
+                                ResultadoAnadir.NoDisponible
+                            }
+                        },
+                        alAbrirCarrito = {
+                            origenCarrito = Pantalla.Detalle
+                            pantalla = Pantalla.Carrito
+                        },
+                        alVolver = { pantalla = Pantalla.Catalogo },
+                        modifier = modificador,
+                    )
+                }
+                Pantalla.Carrito -> {
+                    // Se obtiene el modelo del catálogo para que la carta esté
+                    // cargada y el carrito se ajuste a ella.
+                    catalogoViewModel(versionServidor, intentoCatalogo)
+                    PantallaCarrito(
+                        lineas = carrito.lineas,
+                        total = carrito.total,
+                        avisoQuitadas = carrito.quitadasPorCarta,
+                        alCambiarCantidad = carrito::cambiarCantidad,
+                        alQuitar = carrito::quitar,
+                        alVaciar = carrito::vaciar,
+                        alDescartarAviso = carrito::descartarAviso,
+                        alContinuar = {
+                            // Si había un aviso de pizzas quitadas, ya se ha visto.
+                            carrito.descartarAviso()
+                            pantalla = Pantalla.Datos
+                        },
+                        alVolverALaCarta = { pantalla = Pantalla.Catalogo },
+                        alVolver = { pantalla = origenCarrito },
+                        modifier = modificador,
+                    )
+                }
+                Pantalla.Datos -> {
+                    val catalogo = catalogoViewModel(versionServidor, intentoCatalogo)
+                    val modelo = viewModel<DatosPedidoViewModel>(
+                        key = "datos-$versionServidor-$pedidosEnviados",
+                    ) {
+                        DatosPedidoViewModel(
+                            repositorio = Dependencias.repositorioPedidos(),
+                            carrito = Dependencias.carrito(),
+                            repositorioPagos = Dependencias.repositorioPagos(),
+                            abridor = Dependencias.abridorUrl(),
+                            pedidoEnCurso = Dependencias.pedidoEnCurso(),
+                            registro = Dependencias.registroDiagnostico(),
+                        )
+                    }
+                    val estadoDatos = modelo.estado
+
+                    LaunchedEffect(estadoDatos.enviando) {
+                        enviandoPedido = estadoDatos.enviando
+                    }
+                    // Pedido creado: pasar a la confirmación. La pantalla de datos
+                    // no se puede volver a abrir con el pedido ya enviado.
+                    LaunchedEffect(estadoDatos.pedidoCreado) {
+                        val creado = estadoDatos.pedidoCreado
+                        if (creado != null) {
+                            registro.anotar(
+                                CategoriaDiagnostico.NAVEGACION,
+                                "Pedido n.º ${creado.id} creado: se abre su seguimiento.",
+                            )
+                            pedidoConfirmado = creado
+                            avisoPagoInicial = estadoDatos.avisoPago
+                            pedidoConfirmadoId = creado.id
+                            pedidosEnviados++
+                            pantalla = Pantalla.Confirmado
+                        }
+                    }
+                    // Sin nada en el carrito no hay pedido que enviar (salvo que se esté
+                    // enviando: el carrito se vacía al crearse el pedido, antes del pago).
+                    LaunchedEffect(carrito.estaVacio, estadoDatos.enviando, estadoDatos.pedidoCreado) {
+                        if (debeVolverAlCarritoVacio(carrito.estaVacio, estadoDatos)) {
+                            registro.anotar(CategoriaDiagnostico.NAVEGACION, "Carrito vacío sin pedido: se vuelve al carrito.")
+                            pantalla = Pantalla.Carrito
+                        }
+                    }
+                    // Si se quitaron pizzas porque ya no están en la carta, el
+                    // usuario debe verlo en el carrito antes de enviar.
+                    LaunchedEffect(carrito.quitadasPorCarta) {
+                        if (carrito.quitadasPorCarta.isNotEmpty()) pantalla = Pantalla.Carrito
+                    }
+                    // El servidor rechazó el pedido: se vuelve a cargar la carta y el
+                    // carrito se ajusta a ella (ver catalogoViewModel).
+                    LaunchedEffect(estadoDatos.cartaPorRefrescar) {
+                        if (estadoDatos.cartaPorRefrescar) {
+                            catalogo.cargar()
+                            modelo.cartaRefrescada()
+                        }
+                    }
+
+                    PantallaDatosPedido(
+                        estado = estadoDatos,
+                        unidades = carrito.totalUnidades,
+                        total = carrito.total,
+                        alCambiarTipo = modelo::cambiarTipo,
+                        alCambiarMesa = modelo::cambiarMesa,
+                        alCambiarNombre = modelo::cambiarNombre,
+                        alCambiarTelefono = modelo::cambiarTelefono,
+                        alCambiarDireccion = modelo::cambiarDireccion,
+                        alCambiarObservaciones = modelo::cambiarObservaciones,
+                        alCambiarPagoConTarjeta = modelo::cambiarPagoConTarjeta,
+                        alEnviar = modelo::enviar,
+                        alVolver = { pantalla = Pantalla.Carrito },
+                        modifier = modificador,
+                    )
+                }
+                Pantalla.Confirmado -> {
+                    val id = pedidoConfirmadoId
+                    if (id == null) {
+                        // No debería pasar: sin pedido no hay nada que confirmar.
+                        LaunchedEffect(Unit) { pantalla = Pantalla.Inicio }
+                    } else {
+                        val modelo = viewModel<PedidoConfirmadoViewModel>(key = "pedido-$id") {
+                            PedidoConfirmadoViewModel(
+                                repositorio = Dependencias.repositorioPedidos(),
+                                repositorioPagos = Dependencias.repositorioPagos(),
+                                abridor = Dependencias.abridorUrl(),
+                                pedidoId = id,
+                                pedidoInicial = pedidoConfirmado?.takeIf { it.id == id },
+                                errorPagoInicial = avisoPagoInicial,
+                            )
+                        }
+                        // Un pedido terminado ya no se retoma al arrancar.
+                        val terminado = modelo.estado.pedido?.seguimientoTerminado == true
+                        LaunchedEffect(terminado, id) {
+                            if (terminado && pedidoEnCurso.obtenerId() == id) {
+                                pedidoEnCurso.olvidar()
+                                registro.anotar(CategoriaDiagnostico.PEDIDO, "Id olvidado: el pedido n.º $id ha terminado.")
+                            }
+                        }
+                        // Bucle cancelable: se detiene al salir de la pantalla o
+                        // cuando el estado del pedido es final.
+                        LaunchedEffect(modelo) {
+                            modelo.sondear()
+                        }
+                        val alcance = rememberCoroutineScope()
+                        PantallaPedidoConfirmado(
+                            estado = modelo.estado,
+                            alActualizar = { alcance.launch { modelo.actualizar() } },
+                            alPagarConTarjeta = { alcance.launch { modelo.pagarConTarjeta() } },
+                            alComprobarPago = { alcance.launch { modelo.comprobarPago() } },
+                            alVolverAlInicio = { pantalla = Pantalla.Inicio },
+                            alDejarDeSeguir = {
+                                pedidoEnCurso.olvidar()
+                                registro.anotar(CategoriaDiagnostico.PEDIDO, "Id olvidado: el usuario dejó de seguir el pedido n.º $id.")
+                                pedidoConfirmadoId = null
+                                pedidoConfirmado = null
+                                pantalla = Pantalla.Inicio
+                            },
+                            modifier = modificador,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Obtiene el [CatalogoViewModel] compartido por el catálogo, el detalle, el
+ * carrito y los datos del pedido (así todos ven las mismas pizzas y volver
+ * atrás no recarga la carta) y lanza su carga si hace falta. Un
+ * [versionServidor] distinto crea un modelo nuevo; un [intento] distinto
+ * repite la carga tras un error.
+ */
+@Composable
+private fun catalogoViewModel(versionServidor: Int, intento: Int): CatalogoViewModel {
+    val modelo = viewModel<CatalogoViewModel>(key = "catalogo-$versionServidor") {
+        CatalogoViewModel(Dependencias.repositorioCatalogo())
+    }
+    LaunchedEffect(modelo, intento) {
+        modelo.cargarSiHaceFalta()
+    }
+    // Cada vez que llega una carta nueva, el carrito se ajusta a ella: así no
+    // se envían ids de pizzas que ya no existen o están agotadas.
+    val carrito = remember { Dependencias.carrito() }
+    LaunchedEffect(modelo.estado.pizzas) {
+        if (modelo.estado.cargada) carrito.sincronizarConCarta(modelo.estado.pizzas)
+    }
+    return modelo
+}
